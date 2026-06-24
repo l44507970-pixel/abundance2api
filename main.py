@@ -97,8 +97,10 @@ ABUNDANCE_MAX_STATUS_RETRIES = env_int("ABUNDANCE_MAX_STATUS_RETRIES", 2)
 ABUNDANCE_RETRY_BASE_DELAY_SECONDS = 0.5
 ABUNDANCE_CONNECT_KEEPALIVE_SECONDS = max(1, env_int("ABUNDANCE_CONNECT_KEEPALIVE_SECONDS", 15))
 ABUNDANCE_CONNECT_WORKERS = max(1, env_int("ABUNDANCE_CONNECT_WORKERS", 8))
-MAX_FULL_PROMPT_CHARS = max(2000, env_int("MAX_FULL_PROMPT_CHARS", 24000))
-MAX_FULL_PROMPT_RECENT_MESSAGES = max(2, env_int("MAX_FULL_PROMPT_RECENT_MESSAGES", 16))
+MAX_FULL_PROMPT_CHARS = max(2000, env_int("MAX_FULL_PROMPT_CHARS", 16000))
+MAX_FULL_PROMPT_RECENT_MESSAGES = max(2, env_int("MAX_FULL_PROMPT_RECENT_MESSAGES", 8))
+MAX_FULL_PROMPT_MESSAGE_CHARS = max(500, env_int("MAX_FULL_PROMPT_MESSAGE_CHARS", 2000))
+MAX_UPSTREAM_CONTENT_CHARS = max(2000, env_int("MAX_UPSTREAM_CONTENT_CHARS", 16000))
 ABUNDANCE_USER_AGENT = os.getenv(
     "ABUNDANCE_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -773,6 +775,39 @@ def normalize_parsed_tool_args(parsed_tool: Dict[str, Any], tool: Tool) -> None:
             args["working_directory"] = workdir
 
 
+def truncate_text_middle(text: str, max_chars: int, notice: str) -> str:
+    if len(text) <= max_chars:
+        return text
+
+    omitted = len(text) - max_chars
+    marker = f"\n\n[{notice}: omitted {omitted} characters]\n\n"
+    if len(marker) >= max_chars:
+        return text[-max_chars:]
+
+    remaining = max_chars - len(marker)
+    head_chars = max(0, remaining // 4)
+    tail_chars = remaining - head_chars
+    return f"{text[:head_chars].rstrip()}{marker}{text[-tail_chars:].lstrip()}"
+
+
+def truncate_prompt_segment(text: str, max_chars: int, context: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    logger.info("Truncated %s from %s to %s chars", context, len(text), max_chars)
+    return truncate_text_middle(text, max_chars, "Content Truncated")
+
+
+def limit_upstream_content(content: str) -> str:
+    if len(content) <= MAX_UPSTREAM_CONTENT_CHARS:
+        return content
+    logger.info(
+        "Hard-truncated upstream content from %s to %s chars",
+        len(content),
+        MAX_UPSTREAM_CONTENT_CHARS
+    )
+    return truncate_text_middle(content, MAX_UPSTREAM_CONTENT_CHARS, "Context Truncated")
+
+
 # ===================== 消息历史 -> 单条文本 prompt（全量路径） =====================
 
 def build_tool_result_content(
@@ -822,7 +857,11 @@ def messages_to_prompt(
 
     latest_user_task: Optional[str] = None
     for msg in messages:
-        content = content_to_text(msg.content)
+        content = truncate_prompt_segment(
+            content_to_text(msg.content),
+            MAX_FULL_PROMPT_MESSAGE_CHARS,
+            f"{msg.role} message"
+        )
         if msg.role in {"system", "developer"}:
             if content:
                 prompt_parts.append(f"System: {content}")
@@ -1017,11 +1056,11 @@ def resolve_conversation_and_content(
             incremental_content = build_incremental_content(messages, new_messages, active_tools, tool_choice)
             if incremental_content:
                 remember_fingerprints(session_key, fingerprints)
-                return cached_account, cached_conversation_id, incremental_content, True
+                return cached_account, cached_conversation_id, limit_upstream_content(incremental_content), True
 
     account = choose_abundance_account()
     conversation_id = create_abundance_conversation(account)
-    content = messages_to_limited_prompt(messages, active_tools, tool_choice)
+    content = limit_upstream_content(messages_to_limited_prompt(messages, active_tools, tool_choice))
     remember_conversation_id(session_key, conversation_id)
     remember_conversation_account(session_key, account)
     remember_fingerprints(session_key, fingerprints)
@@ -1402,6 +1441,17 @@ def choose_abundance_account() -> Dict[str, Any]:
         return account
 
 
+def abundance_account_candidates(primary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    primary_name = account_name(primary)
+    candidates = [primary]
+    candidates.extend(
+        account
+        for account in ABUNDANCE_ACCOUNTS
+        if account_name(account) != primary_name
+    )
+    return candidates
+
+
 def is_jwt_expired(token: str, leeway_seconds: int = 60) -> bool:
     parts = token.split(".")
     if len(parts) < 2:
@@ -1643,6 +1693,60 @@ def call_abundance_api(
     return abundance_post(account, url, body, stream=True, action="send-message")
 
 
+def should_try_next_account(exc: Exception) -> bool:
+    if not isinstance(exc, HTTPException):
+        return False
+    detail = str(exc.detail)
+    retry_markers = (
+        "a.b.u.n.dance send-message API returned HTTP",
+        "a.b.u.n.dance create-conversation API returned HTTP",
+        "a.b.u.n.dance rejected the send-message request",
+        "a.b.u.n.dance rejected the create-conversation request",
+    )
+    return any(marker in detail for marker in retry_markers)
+
+
+def call_abundance_api_with_account_fallback(
+    account: Dict[str, Any],
+    conversation_id: str,
+    content: str,
+    model: str,
+    session_key: Optional[str] = None
+):
+    candidates = abundance_account_candidates(account)
+    last_exc: Optional[Exception] = None
+
+    for index, candidate in enumerate(candidates):
+        try:
+            candidate_conversation_id = conversation_id
+            if index > 0:
+                candidate_conversation_id = create_abundance_conversation(candidate)
+            resp = call_abundance_api(candidate, candidate_conversation_id, content, model)
+            if index > 0:
+                remember_conversation_id(session_key, candidate_conversation_id)
+                remember_conversation_account(session_key, candidate)
+                logger.info(
+                    "Recovered a.b.u.n.dance send-message by switching account from %s to %s",
+                    account_name(account),
+                    account_name(candidate)
+                )
+            return candidate, candidate_conversation_id, resp
+        except Exception as exc:
+            last_exc = exc
+            if index + 1 >= len(candidates) or not should_try_next_account(exc):
+                raise
+            logger.warning(
+                "a.b.u.n.dance send-message failed on %s: %s; retrying with %s",
+                account_name(candidate),
+                exception_message(exc),
+                account_name(candidates[index + 1])
+            )
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("a.b.u.n.dance account fallback loop exited unexpectedly")
+
+
 def create_abundance_conversation(account: Dict[str, Any]) -> str:
     """上游没有"按 id 自动建会话"的语义：必须先 POST /api/conversations 拿到真实 id，
     才能向 /api/conversations/{id}/messages 发消息，否则会失败。"""
@@ -1837,8 +1941,21 @@ def stream_start_chunk(model: str, request_id: str) -> str:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def wait_for_abundance_stream_response(account: Dict[str, Any], conversation_id: str, content: str, model: str):
-    future = UPSTREAM_CONNECT_EXECUTOR.submit(call_abundance_api, account, conversation_id, content, model)
+def wait_for_abundance_stream_response(
+    account: Dict[str, Any],
+    conversation_id: str,
+    content: str,
+    model: str,
+    session_key: Optional[str] = None
+):
+    future = UPSTREAM_CONNECT_EXECUTOR.submit(
+        call_abundance_api_with_account_fallback,
+        account,
+        conversation_id,
+        content,
+        model,
+        session_key
+    )
     while True:
         try:
             yield future.result(timeout=ABUNDANCE_CONNECT_KEEPALIVE_SECONDS)
@@ -1859,7 +1976,8 @@ def stream_generator(
     conversation_id: str,
     content: str,
     request_id: str,
-    tools: Optional[List[Tool]] = None
+    tools: Optional[List[Tool]] = None,
+    session_key: Optional[str] = None
 ):
     """Starlette 在 StreamingResponse 拉取第一个分片之前就已经发出 200 状态行，
     所以这里必须把包括首次上游调用在内的一切异常都兜住，转成一段 SSE 错误增量
@@ -1868,13 +1986,13 @@ def stream_generator(
     resp = None
     try:
         yield stream_start_chunk(model, request_id)
-        connect_waiter = wait_for_abundance_stream_response(account, conversation_id, content, model)
+        connect_waiter = wait_for_abundance_stream_response(account, conversation_id, content, model, session_key)
         while resp is None:
             item = next(connect_waiter)
             if isinstance(item, str):
                 yield item
             else:
-                resp = item
+                _, _, resp = item
 
         for event_name, payload, _raw in iter_abundance_sse_events(resp):
             if event_name in {"connecting", "heartbeat"}:
@@ -1966,9 +2084,10 @@ def get_complete_response(
     model: str,
     conversation_id: str,
     content: str,
-    tools: Optional[List[Tool]] = None
+    tools: Optional[List[Tool]] = None,
+    session_key: Optional[str] = None
 ) -> Dict[str, Any]:
-    resp = call_abundance_api(account, conversation_id, content, model)
+    _, _, resp = call_abundance_api_with_account_fallback(account, conversation_id, content, model, session_key)
     result = ""
     final_text: Optional[str] = None
 
@@ -2135,11 +2254,26 @@ async def chat_completions(
 
     if request.stream:
         return StreamingResponse(
-            stream_generator(abundance_account, request.model, abundance_conversation_id, content, request_id, active_tools),
+            stream_generator(
+                abundance_account,
+                request.model,
+                abundance_conversation_id,
+                content,
+                request_id,
+                active_tools,
+                session_key
+            ),
             media_type="text/event-stream"
         )
 
-    result = get_complete_response(abundance_account, request.model, abundance_conversation_id, content, active_tools)
+    result = get_complete_response(
+        abundance_account,
+        request.model,
+        abundance_conversation_id,
+        content,
+        active_tools,
+        session_key
+    )
     response = build_chat_completion_payload(request_id, request.model, result, content)
     return JSONResponse(content=response)
 

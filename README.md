@@ -61,8 +61,10 @@ Invoke-RestMethod http://127.0.0.1:18000/healthz
 - `ABUNDANCE_REQUEST_TIMEOUT_SECONDS`：默认 `120`。
 - `ABUNDANCE_CONNECT_KEEPALIVE_SECONDS`：默认 `15`，等待上游建立流式连接时发送 SSE keep-alive。
 - `ABUNDANCE_CONNECT_WORKERS`：默认 `8`，等待上游连接的后台线程数。
-- `MAX_FULL_PROMPT_CHARS`：默认 `24000`，冷启动全量历史超过后会自动压缩。
-- `MAX_FULL_PROMPT_RECENT_MESSAGES`：默认 `16`，长历史压缩时保留的最近消息数。
+- `MAX_FULL_PROMPT_CHARS`：默认 `16000`，冷启动全量历史超过后会自动压缩。
+- `MAX_FULL_PROMPT_RECENT_MESSAGES`：默认 `8`，长历史压缩时保留的最近消息数。
+- `MAX_FULL_PROMPT_MESSAGE_CHARS`：默认 `2000`，单条历史消息超过后会裁剪。
+- `MAX_UPSTREAM_CONTENT_CHARS`：默认 `16000`，最终发给上游的正文硬上限；如果长上下文仍不稳定，可以降到 `12000`。
 - `ABUNDANCE_HTTP_PROXY`：需要代理访问上游时设置。
 - `PORT`：Zeabur 通常会自动注入；未设置时默认 `18000`。
 
