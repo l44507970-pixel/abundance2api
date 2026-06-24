@@ -97,10 +97,11 @@ ABUNDANCE_MAX_STATUS_RETRIES = env_int("ABUNDANCE_MAX_STATUS_RETRIES", 2)
 ABUNDANCE_RETRY_BASE_DELAY_SECONDS = 0.5
 ABUNDANCE_CONNECT_KEEPALIVE_SECONDS = max(1, env_int("ABUNDANCE_CONNECT_KEEPALIVE_SECONDS", 15))
 ABUNDANCE_CONNECT_WORKERS = max(1, env_int("ABUNDANCE_CONNECT_WORKERS", 8))
-MAX_FULL_PROMPT_CHARS = max(2000, env_int("MAX_FULL_PROMPT_CHARS", 16000))
-MAX_FULL_PROMPT_RECENT_MESSAGES = max(2, env_int("MAX_FULL_PROMPT_RECENT_MESSAGES", 8))
-MAX_FULL_PROMPT_MESSAGE_CHARS = max(500, env_int("MAX_FULL_PROMPT_MESSAGE_CHARS", 2000))
-MAX_UPSTREAM_CONTENT_CHARS = max(2000, env_int("MAX_UPSTREAM_CONTENT_CHARS", 16000))
+MAX_FULL_PROMPT_CHARS = max(2000, env_int("MAX_FULL_PROMPT_CHARS", 32000))
+MAX_FULL_PROMPT_RECENT_MESSAGES = max(2, env_int("MAX_FULL_PROMPT_RECENT_MESSAGES", 12))
+MAX_FULL_PROMPT_MESSAGE_CHARS = max(500, env_int("MAX_FULL_PROMPT_MESSAGE_CHARS", 4000))
+MAX_UPSTREAM_CONTENT_CHARS = max(2000, env_int("MAX_UPSTREAM_CONTENT_CHARS", 32000))
+MAX_UPSTREAM_RETRY_CONTENT_CHARS = max(2000, env_int("MAX_UPSTREAM_RETRY_CONTENT_CHARS", 16000))
 ABUNDANCE_USER_AGENT = os.getenv(
     "ABUNDANCE_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -797,15 +798,33 @@ def truncate_prompt_segment(text: str, max_chars: int, context: str) -> str:
     return truncate_text_middle(text, max_chars, "Content Truncated")
 
 
-def limit_upstream_content(content: str) -> str:
-    if len(content) <= MAX_UPSTREAM_CONTENT_CHARS:
+def limit_upstream_content(
+    content: str,
+    max_chars: int = MAX_UPSTREAM_CONTENT_CHARS,
+    notice: str = "Context Truncated"
+) -> str:
+    if len(content) <= max_chars:
         return content
     logger.info(
         "Hard-truncated upstream content from %s to %s chars",
         len(content),
-        MAX_UPSTREAM_CONTENT_CHARS
+        max_chars
     )
-    return truncate_text_middle(content, MAX_UPSTREAM_CONTENT_CHARS, "Context Truncated")
+    return truncate_text_middle(content, max_chars, notice)
+
+
+def upstream_content_variants(content: str) -> List[tuple[str, str]]:
+    primary = limit_upstream_content(content, MAX_UPSTREAM_CONTENT_CHARS, "Context Truncated")
+    variants = [("primary", primary)]
+
+    retry_limit = min(MAX_UPSTREAM_RETRY_CONTENT_CHARS, MAX_UPSTREAM_CONTENT_CHARS)
+    if retry_limit < len(primary):
+        variants.append(("short-fallback", limit_upstream_content(
+            primary,
+            retry_limit,
+            "Retry Context Truncated"
+        )))
+    return variants
 
 
 # ===================== 消息历史 -> 单条文本 prompt（全量路径） =====================
@@ -1693,7 +1712,7 @@ def call_abundance_api(
     return abundance_post(account, url, body, stream=True, action="send-message")
 
 
-def should_try_next_account(exc: Exception) -> bool:
+def should_retry_abundance_request(exc: Exception) -> bool:
     if not isinstance(exc, HTTPException):
         return False
     detail = str(exc.detail)
@@ -1706,6 +1725,19 @@ def should_try_next_account(exc: Exception) -> bool:
     return any(marker in detail for marker in retry_markers)
 
 
+def should_retry_shorter_content(exc: Exception) -> bool:
+    if not isinstance(exc, HTTPException):
+        return False
+    detail = str(exc.detail)
+    retry_markers = (
+        "a.b.u.n.dance send-message API returned HTTP 400",
+        "a.b.u.n.dance send-message API returned HTTP 413",
+        "a.b.u.n.dance send-message API returned HTTP 414",
+        "a.b.u.n.dance send-message API returned HTTP 422",
+    )
+    return any(marker in detail for marker in retry_markers)
+
+
 def call_abundance_api_with_account_fallback(
     account: Dict[str, Any],
     conversation_id: str,
@@ -1714,33 +1746,58 @@ def call_abundance_api_with_account_fallback(
     session_key: Optional[str] = None
 ):
     candidates = abundance_account_candidates(account)
+    content_variants = upstream_content_variants(content)
     last_exc: Optional[Exception] = None
 
-    for index, candidate in enumerate(candidates):
-        try:
-            candidate_conversation_id = conversation_id
-            if index > 0:
-                candidate_conversation_id = create_abundance_conversation(candidate)
-            resp = call_abundance_api(candidate, candidate_conversation_id, content, model)
-            if index > 0:
-                remember_conversation_id(session_key, candidate_conversation_id)
-                remember_conversation_account(session_key, candidate)
-                logger.info(
-                    "Recovered a.b.u.n.dance send-message by switching account from %s to %s",
-                    account_name(account),
-                    account_name(candidate)
+    for content_index, (content_label, candidate_content) in enumerate(content_variants):
+        for account_index, candidate in enumerate(candidates):
+            try:
+                is_first_attempt = content_index == 0 and account_index == 0
+                candidate_conversation_id = conversation_id
+                if not is_first_attempt:
+                    candidate_conversation_id = create_abundance_conversation(candidate)
+
+                resp = call_abundance_api(candidate, candidate_conversation_id, candidate_content, model)
+                if not is_first_attempt:
+                    remember_conversation_id(session_key, candidate_conversation_id)
+                    remember_conversation_account(session_key, candidate)
+                    logger.info(
+                        "Recovered a.b.u.n.dance send-message with account=%s content_variant=%s content_len=%s",
+                        account_name(candidate),
+                        content_label,
+                        len(candidate_content)
+                    )
+                return candidate, candidate_conversation_id, candidate_content, resp
+            except Exception as exc:
+                last_exc = exc
+                if not should_retry_abundance_request(exc):
+                    raise
+
+                has_next_account = account_index + 1 < len(candidates)
+                has_shorter_content = (
+                    content_index + 1 < len(content_variants)
+                    and should_retry_shorter_content(exc)
                 )
-            return candidate, candidate_conversation_id, resp
-        except Exception as exc:
-            last_exc = exc
-            if index + 1 >= len(candidates) or not should_try_next_account(exc):
-                raise
-            logger.warning(
-                "a.b.u.n.dance send-message failed on %s: %s; retrying with %s",
-                account_name(candidate),
-                exception_message(exc),
-                account_name(candidates[index + 1])
-            )
+                if not has_next_account and not has_shorter_content:
+                    raise
+
+                if has_next_account:
+                    logger.warning(
+                        "a.b.u.n.dance send-message failed on %s with %s content (%s chars): %s; retrying with %s",
+                        account_name(candidate),
+                        content_label,
+                        len(candidate_content),
+                        exception_message(exc),
+                        account_name(candidates[account_index + 1])
+                    )
+                    continue
+
+                logger.warning(
+                    "a.b.u.n.dance send-message failed for all accounts with %s content (%s chars): %s; retrying with shorter content",
+                    content_label,
+                    len(candidate_content),
+                    exception_message(exc)
+                )
 
     if last_exc:
         raise last_exc
@@ -1992,7 +2049,7 @@ def stream_generator(
             if isinstance(item, str):
                 yield item
             else:
-                _, _, resp = item
+                _, _, _, resp = item
 
         for event_name, payload, _raw in iter_abundance_sse_events(resp):
             if event_name in {"connecting", "heartbeat"}:
@@ -2087,7 +2144,13 @@ def get_complete_response(
     tools: Optional[List[Tool]] = None,
     session_key: Optional[str] = None
 ) -> Dict[str, Any]:
-    _, _, resp = call_abundance_api_with_account_fallback(account, conversation_id, content, model, session_key)
+    _, _, used_content, resp = call_abundance_api_with_account_fallback(
+        account,
+        conversation_id,
+        content,
+        model,
+        session_key
+    )
     result = ""
     final_text: Optional[str] = None
 
@@ -2131,7 +2194,8 @@ def get_complete_response(
         "content": content_out,
         "raw_content": raw_content,
         "tool_calls": tool_calls,
-        "finish_reason": finish_reason
+        "finish_reason": finish_reason,
+        "prompt_text": used_content
     }
 
 
@@ -2274,7 +2338,12 @@ async def chat_completions(
         active_tools,
         session_key
     )
-    response = build_chat_completion_payload(request_id, request.model, result, content)
+    response = build_chat_completion_payload(
+        request_id,
+        request.model,
+        result,
+        result.get("prompt_text", content)
+    )
     return JSONResponse(content=response)
 
 
