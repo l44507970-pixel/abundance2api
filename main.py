@@ -14,6 +14,7 @@ import os
 import hashlib
 import secrets
 import base64
+import threading
 from http.cookies import SimpleCookie
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -134,6 +135,11 @@ SESSION_FINGERPRINTS: Dict[str, List[str]] = {}
 # 必须先调用 POST /api/conversations 拿到真实 id 才能继续对话，所以这里缓存的是
 # 已经真实创建过的会话，而不是本地随便派生的 UUID。
 CONVERSATION_CACHE: Dict[str, str] = {}
+
+# 上游可能在 create-conversation 等请求里刷新 Cookie；浏览器会自动保存，
+# 代理也需要复用这些 Set-Cookie，避免后续 send-message 使用过期静态 Cookie。
+ABUNDANCE_DYNAMIC_COOKIES: Dict[str, str] = {}
+ABUNDANCE_COOKIE_LOCK = threading.Lock()
 
 
 # ===================== OpenAI 兼容的请求模型 =====================
@@ -1273,6 +1279,8 @@ def abundance_cookies(include_oidc: bool = True) -> Dict[str, str]:
         cookies["session"] = ABUNDANCE_SESSION_COOKIE
     if include_oidc and ABUNDANCE_OIDC_TOKEN:
         cookies["oidc_id_token"] = ABUNDANCE_OIDC_TOKEN
+    with ABUNDANCE_COOKIE_LOCK:
+        cookies.update(ABUNDANCE_DYNAMIC_COOKIES)
 
     # id_token 通常只有约 1 小时有效期；过期后优先让长期 session 独立工作。
     oidc_token = cookies.get("oidc_id_token")
@@ -1304,11 +1312,41 @@ def describe_cookie_variant(cookies: Dict[str, str]) -> str:
     return "custom-cookie"
 
 
+def cookies_from_response(resp) -> Dict[str, str]:
+    cookies: Dict[str, str] = {}
+    response_cookies = getattr(resp, "cookies", None)
+    if response_cookies is not None:
+        try:
+            for key, value in response_cookies.items():
+                if value:
+                    cookies[str(key)] = str(value)
+        except Exception:
+            logger.debug("Failed to read response cookies object", exc_info=True)
+
+    try:
+        set_cookie = resp.headers.get("set-cookie")
+    except Exception:
+        set_cookie = None
+    if set_cookie:
+        cookies.update(parse_cookie_header(set_cookie))
+    return cookies
+
+
+def remember_abundance_response_cookies(resp) -> None:
+    cookies = cookies_from_response(resp)
+    if not cookies:
+        return
+    with ABUNDANCE_COOKIE_LOCK:
+        ABUNDANCE_DYNAMIC_COOKIES.update(cookies)
+    logger.info("Stored refreshed a.b.u.n.dance cookies: %s", sorted(cookies.keys()))
+
+
 def abundance_headers() -> Dict[str, str]:
     return {
         "accept": "*/*",
         "content-type": "application/json",
         "origin": ABUNDANCE_BASE_URL,
+        "referer": f"{ABUNDANCE_BASE_URL}/home",
         "user-agent": ABUNDANCE_USER_AGENT,
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
@@ -1361,6 +1399,7 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
 
         for attempt in range(1, max_attempts + 1):
             resp = curl_cffi.requests.post(url, **variant_kwargs)
+            remember_abundance_response_cookies(resp)
 
             if resp.status_code == 200:
                 return resp
@@ -1435,6 +1474,7 @@ def call_abundance_api(
     url = f"{ABUNDANCE_BASE_URL}/api/conversations/{conversation_id}/messages"
     body = {
         "content": content,
+        "displayContent": content,
         "model": model,
         "speed": speed or ABUNDANCE_DEFAULT_SPEED,
         "intelligence": intelligence or ABUNDANCE_DEFAULT_INTELLIGENCE,
