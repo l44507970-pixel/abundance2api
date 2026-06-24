@@ -60,6 +60,7 @@ ACCEPT_ANY_API_KEY = os.getenv("ACCEPT_ANY_API_KEY", "false").lower() not in {"0
 
 # a.b.u.n.dance 上游配置（本代理 -> a.b.u.n.dance）
 ABUNDANCE_BASE_URL = os.getenv("ABUNDANCE_BASE_URL", "https://a.b.u.n.dance").rstrip("/")
+ABUNDANCE_ACCOUNTS_JSON = os.getenv("ABUNDANCE_ACCOUNTS_JSON", "").strip()
 ABUNDANCE_RAW_COOKIE = os.getenv("ABUNDANCE_COOKIE", "").strip()
 ABUNDANCE_SESSION_COOKIE = os.getenv("ABUNDANCE_SESSION", "").strip()
 ABUNDANCE_OIDC_TOKEN = os.getenv("ABUNDANCE_OIDC_TOKEN", "").strip()
@@ -96,6 +97,8 @@ ABUNDANCE_MAX_STATUS_RETRIES = env_int("ABUNDANCE_MAX_STATUS_RETRIES", 2)
 ABUNDANCE_RETRY_BASE_DELAY_SECONDS = 0.5
 ABUNDANCE_CONNECT_KEEPALIVE_SECONDS = max(1, env_int("ABUNDANCE_CONNECT_KEEPALIVE_SECONDS", 15))
 ABUNDANCE_CONNECT_WORKERS = max(1, env_int("ABUNDANCE_CONNECT_WORKERS", 8))
+MAX_FULL_PROMPT_CHARS = max(2000, env_int("MAX_FULL_PROMPT_CHARS", 24000))
+MAX_FULL_PROMPT_RECENT_MESSAGES = max(2, env_int("MAX_FULL_PROMPT_RECENT_MESSAGES", 16))
 ABUNDANCE_USER_AGENT = os.getenv(
     "ABUNDANCE_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -136,11 +139,15 @@ SESSION_FINGERPRINTS: Dict[str, List[str]] = {}
 # 必须先调用 POST /api/conversations 拿到真实 id 才能继续对话，所以这里缓存的是
 # 已经真实创建过的会话，而不是本地随便派生的 UUID。
 CONVERSATION_CACHE: Dict[str, str] = {}
+CONVERSATION_ACCOUNT_CACHE: Dict[str, str] = {}
 
 # 上游可能在 create-conversation 等请求里刷新 Cookie；浏览器会自动保存，
 # 代理也需要复用这些 Set-Cookie，避免后续 send-message 使用过期静态 Cookie。
 ABUNDANCE_DYNAMIC_COOKIES: Dict[str, str] = {}
 ABUNDANCE_COOKIE_LOCK = threading.Lock()
+ABUNDANCE_ACCOUNT_LOCK = threading.Lock()
+ABUNDANCE_ROUND_ROBIN_INDEX = 0
+THREAD_LOCK_TYPE = type(threading.Lock())
 
 
 # ===================== OpenAI 兼容的请求模型 =====================
@@ -846,6 +853,57 @@ def messages_to_prompt(
     return "\n\n".join(part for part in prompt_parts if part)
 
 
+def compact_messages_for_full_prompt(messages: List[Message]) -> List[Message]:
+    full_prompt = messages_to_prompt(messages)
+    if len(full_prompt) <= MAX_FULL_PROMPT_CHARS:
+        return messages
+
+    pinned: List[Message] = [msg for msg in messages if msg.role in {"system", "developer"}]
+    recent = messages[-MAX_FULL_PROMPT_RECENT_MESSAGES:]
+    compacted: List[Message] = []
+    seen_ids = set()
+    for msg in [*pinned, *recent]:
+        msg_id = id(msg)
+        if msg_id not in seen_ids:
+            compacted.append(msg)
+            seen_ids.add(msg_id)
+
+    logger.info(
+        "Compacted full prompt history from %s to %s messages; original_chars=%s max_chars=%s",
+        len(messages),
+        len(compacted),
+        len(full_prompt),
+        MAX_FULL_PROMPT_CHARS
+    )
+    return compacted
+
+
+def messages_to_limited_prompt(
+    messages: List[Message],
+    tools: Optional[List[Tool]] = None,
+    tool_choice: Optional[Union[str, ToolChoice, Dict[str, Any]]] = None
+) -> str:
+    content = messages_to_prompt(messages, tools, tool_choice)
+    if len(content) <= MAX_FULL_PROMPT_CHARS:
+        return content
+
+    compacted = compact_messages_for_full_prompt(messages)
+    compacted_content = messages_to_prompt(compacted, tools, tool_choice)
+    notice = (
+        "[Context Notice]\n"
+        "The client sent a very long conversation history. Older middle turns were omitted "
+        "to keep this upstream request stable. Use the preserved system/developer messages "
+        "and the most recent turns as the source of truth."
+    )
+    content = f"{notice}\n\n{compacted_content}" if compacted_content else notice
+    if len(content) <= MAX_FULL_PROMPT_CHARS:
+        return content
+
+    prefix = f"{notice}\n\n[Trimmed Recent Context]\n"
+    tail_budget = max(1000, MAX_FULL_PROMPT_CHARS - len(prefix))
+    return f"{prefix}{content[-tail_budget:]}"
+
+
 # ===================== 增量发送（按会话缓存指纹） =====================
 
 def message_fingerprint(msg: Message) -> str:
@@ -923,8 +981,16 @@ def remember_conversation_id(session_key: Optional[str], conversation_id: str) -
     if not session_key:
         return
     if session_key not in CONVERSATION_CACHE and len(CONVERSATION_CACHE) >= MAX_FINGERPRINT_SESSIONS:
-        CONVERSATION_CACHE.pop(next(iter(CONVERSATION_CACHE)), None)
+        evicted_key = next(iter(CONVERSATION_CACHE))
+        CONVERSATION_CACHE.pop(evicted_key, None)
+        CONVERSATION_ACCOUNT_CACHE.pop(evicted_key, None)
     CONVERSATION_CACHE[session_key] = conversation_id
+
+
+def remember_conversation_account(session_key: Optional[str], account: Dict[str, Any]) -> None:
+    if not session_key:
+        return
+    CONVERSATION_ACCOUNT_CACHE[session_key] = account_name(account)
 
 
 def resolve_conversation_and_content(
@@ -932,7 +998,7 @@ def resolve_conversation_and_content(
     messages: List[Message],
     active_tools: Optional[List[Tool]],
     tool_choice: Optional[Union[str, ToolChoice, Dict[str, Any]]]
-) -> tuple[str, str, bool]:
+) -> tuple[Dict[str, Any], str, str, bool]:
     """返回 (上游 conversation id, 要发给上游的 content, 是否走了增量路径)。
 
     上游必须先创建会话才能发消息，所以"能否增量发送"和"用哪个会话 id"是绑在一起的：
@@ -943,20 +1009,23 @@ def resolve_conversation_and_content(
 
     if session_key:
         cached_conversation_id = CONVERSATION_CACHE.get(session_key)
+        cached_account = get_abundance_account(CONVERSATION_ACCOUNT_CACHE.get(session_key))
         previous_fingerprints = SESSION_FINGERPRINTS.get(session_key)
-        if cached_conversation_id and previous_fingerprints and len(fingerprints) > len(previous_fingerprints) \
+        if cached_account and cached_conversation_id and previous_fingerprints and len(fingerprints) > len(previous_fingerprints) \
                 and fingerprints[:len(previous_fingerprints)] == previous_fingerprints:
             new_messages = messages[len(previous_fingerprints):]
             incremental_content = build_incremental_content(messages, new_messages, active_tools, tool_choice)
             if incremental_content:
                 remember_fingerprints(session_key, fingerprints)
-                return cached_conversation_id, incremental_content, True
+                return cached_account, cached_conversation_id, incremental_content, True
 
-    conversation_id = create_abundance_conversation()
-    content = messages_to_prompt(messages, active_tools, tool_choice)
+    account = choose_abundance_account()
+    conversation_id = create_abundance_conversation(account)
+    content = messages_to_limited_prompt(messages, active_tools, tool_choice)
     remember_conversation_id(session_key, conversation_id)
+    remember_conversation_account(session_key, account)
     remember_fingerprints(session_key, fingerprints)
-    return conversation_id, content, False
+    return account, conversation_id, content, False
 
 
 # ===================== 工具调用：XML 输出解析 =====================
@@ -1256,6 +1325,83 @@ def parse_cookie_header(cookie_header: str) -> Dict[str, str]:
     return {key: morsel.value for key, morsel in parsed.items() if morsel.value}
 
 
+def make_abundance_account(
+    name: str,
+    raw_cookie: str = "",
+    session: str = "",
+    oidc_token: str = ""
+) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "raw_cookie": raw_cookie.strip(),
+        "session": session.strip(),
+        "oidc_token": oidc_token.strip(),
+        "dynamic_cookies": {},
+        "lock": threading.Lock(),
+    }
+
+
+def load_abundance_accounts() -> List[Dict[str, Any]]:
+    accounts: List[Dict[str, Any]] = []
+
+    if ABUNDANCE_ACCOUNTS_JSON:
+        try:
+            parsed = json.loads(ABUNDANCE_ACCOUNTS_JSON)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            if isinstance(parsed, list):
+                for index, item in enumerate(parsed, start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    account = make_abundance_account(
+                        normalize_identifier(item.get("name")) or f"account-{index}",
+                        normalize_identifier(item.get("cookie") or item.get("raw_cookie")) or "",
+                        normalize_identifier(item.get("session")) or "",
+                        normalize_identifier(item.get("oidc_id_token") or item.get("oidc_token")) or ""
+                    )
+                    if account["raw_cookie"] or account["session"] or account["oidc_token"]:
+                        accounts.append(account)
+        except Exception:
+            logger.warning("Failed to parse ABUNDANCE_ACCOUNTS_JSON; falling back to indexed cookie env vars", exc_info=True)
+
+    for index in range(1, 21):
+        raw_cookie = os.getenv(f"ABUNDANCE_COOKIE_{index}", "").strip()
+        session = os.getenv(f"ABUNDANCE_SESSION_{index}", "").strip()
+        oidc_token = os.getenv(f"ABUNDANCE_OIDC_TOKEN_{index}", "").strip()
+        if raw_cookie or session or oidc_token:
+            accounts.append(make_abundance_account(f"account-{index}", raw_cookie, session, oidc_token))
+
+    if not accounts:
+        accounts.append(make_abundance_account("default", ABUNDANCE_RAW_COOKIE, ABUNDANCE_SESSION_COOKIE, ABUNDANCE_OIDC_TOKEN))
+
+    logger.info("Loaded %s a.b.u.n.dance account(s): %s", len(accounts), [account["name"] for account in accounts])
+    return accounts
+
+
+ABUNDANCE_ACCOUNTS = load_abundance_accounts()
+
+
+def account_name(account: Dict[str, Any]) -> str:
+    return str(account.get("name") or "default")
+
+
+def get_abundance_account(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not name:
+        return None
+    for account in ABUNDANCE_ACCOUNTS:
+        if account_name(account) == name:
+            return account
+    return None
+
+
+def choose_abundance_account() -> Dict[str, Any]:
+    global ABUNDANCE_ROUND_ROBIN_INDEX
+    with ABUNDANCE_ACCOUNT_LOCK:
+        account = ABUNDANCE_ACCOUNTS[ABUNDANCE_ROUND_ROBIN_INDEX % len(ABUNDANCE_ACCOUNTS)]
+        ABUNDANCE_ROUND_ROBIN_INDEX += 1
+        return account
+
+
 def is_jwt_expired(token: str, leeway_seconds: int = 60) -> bool:
     parts = token.split(".")
     if len(parts) < 2:
@@ -1274,14 +1420,20 @@ def is_jwt_expired(token: str, leeway_seconds: int = 60) -> bool:
     return exp <= time.time() + leeway_seconds
 
 
-def abundance_cookies(include_oidc: bool = True) -> Dict[str, str]:
-    cookies = parse_cookie_header(ABUNDANCE_RAW_COOKIE)
-    if ABUNDANCE_SESSION_COOKIE:
-        cookies["session"] = ABUNDANCE_SESSION_COOKIE
-    if include_oidc and ABUNDANCE_OIDC_TOKEN:
-        cookies["oidc_id_token"] = ABUNDANCE_OIDC_TOKEN
-    with ABUNDANCE_COOKIE_LOCK:
-        cookies.update(ABUNDANCE_DYNAMIC_COOKIES)
+def abundance_cookies(account: Dict[str, Any], include_oidc: bool = True) -> Dict[str, str]:
+    cookies = parse_cookie_header(str(account.get("raw_cookie") or ""))
+    session = str(account.get("session") or "").strip()
+    oidc_token_value = str(account.get("oidc_token") or "").strip()
+    if session:
+        cookies["session"] = session
+    if include_oidc and oidc_token_value:
+        cookies["oidc_id_token"] = oidc_token_value
+    lock = account.get("lock")
+    if isinstance(lock, THREAD_LOCK_TYPE):
+        with lock:
+            cookies.update(account.get("dynamic_cookies") or {})
+    else:
+        cookies.update(account.get("dynamic_cookies") or {})
 
     # id_token 通常只有约 1 小时有效期；过期后优先让长期 session 独立工作。
     oidc_token = cookies.get("oidc_id_token")
@@ -1290,8 +1442,8 @@ def abundance_cookies(include_oidc: bool = True) -> Dict[str, str]:
     return cookies
 
 
-def abundance_cookie_variants() -> List[Dict[str, str]]:
-    primary = abundance_cookies(include_oidc=True)
+def abundance_cookie_variants(account: Dict[str, Any]) -> List[Dict[str, str]]:
+    primary = abundance_cookies(account, include_oidc=True)
     if not primary:
         return []
 
@@ -1333,13 +1485,18 @@ def cookies_from_response(resp) -> Dict[str, str]:
     return cookies
 
 
-def remember_abundance_response_cookies(resp) -> None:
+def remember_abundance_response_cookies(account: Dict[str, Any], resp) -> None:
     cookies = cookies_from_response(resp)
     if not cookies:
         return
-    with ABUNDANCE_COOKIE_LOCK:
-        ABUNDANCE_DYNAMIC_COOKIES.update(cookies)
-    logger.info("Stored refreshed a.b.u.n.dance cookies: %s", sorted(cookies.keys()))
+    dynamic_cookies = account.setdefault("dynamic_cookies", {})
+    lock = account.get("lock")
+    if isinstance(lock, THREAD_LOCK_TYPE):
+        with lock:
+            dynamic_cookies.update(cookies)
+    else:
+        dynamic_cookies.update(cookies)
+    logger.info("Stored refreshed a.b.u.n.dance cookies for %s: %s", account_name(account), sorted(cookies.keys()))
 
 
 def abundance_headers() -> Dict[str, str]:
@@ -1372,9 +1529,9 @@ def should_retry_upstream_status(status_code: int) -> bool:
     return status_code == 429 or 500 <= status_code < 600
 
 
-def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
+def abundance_post(account: Dict[str, Any], url: str, body: Dict[str, Any], stream: bool, action: str):
     """带重试地向 a.b.u.n.dance 发 POST；认证失败时自动尝试 session-only。"""
-    cookie_variants = abundance_cookie_variants()
+    cookie_variants = abundance_cookie_variants(account)
     if not cookie_variants:
         raise HTTPException(
             status_code=500,
@@ -1400,7 +1557,7 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
 
         for attempt in range(1, max_attempts + 1):
             resp = curl_cffi.requests.post(url, **variant_kwargs)
-            remember_abundance_response_cookies(resp)
+            remember_abundance_response_cookies(account, resp)
 
             if resp.status_code == 200:
                 return resp
@@ -1466,6 +1623,7 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
 
 
 def call_abundance_api(
+    account: Dict[str, Any],
     conversation_id: str,
     content: str,
     model: str,
@@ -1482,14 +1640,14 @@ def call_abundance_api(
     if ABUNDANCE_SEND_TUNING_FIELDS:
         body["speed"] = speed or ABUNDANCE_DEFAULT_SPEED
         body["intelligence"] = intelligence or ABUNDANCE_DEFAULT_INTELLIGENCE
-    return abundance_post(url, body, stream=True, action="send-message")
+    return abundance_post(account, url, body, stream=True, action="send-message")
 
 
-def create_abundance_conversation() -> str:
+def create_abundance_conversation(account: Dict[str, Any]) -> str:
     """上游没有"按 id 自动建会话"的语义：必须先 POST /api/conversations 拿到真实 id，
     才能向 /api/conversations/{id}/messages 发消息，否则会失败。"""
     url = f"{ABUNDANCE_BASE_URL}/api/conversations"
-    resp = abundance_post(url, {}, stream=False, action="create-conversation")
+    resp = abundance_post(account, url, {}, stream=False, action="create-conversation")
     try:
         payload = resp.json()
     except ValueError:
@@ -1679,8 +1837,8 @@ def stream_start_chunk(model: str, request_id: str) -> str:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def wait_for_abundance_stream_response(conversation_id: str, content: str, model: str):
-    future = UPSTREAM_CONNECT_EXECUTOR.submit(call_abundance_api, conversation_id, content, model)
+def wait_for_abundance_stream_response(account: Dict[str, Any], conversation_id: str, content: str, model: str):
+    future = UPSTREAM_CONNECT_EXECUTOR.submit(call_abundance_api, account, conversation_id, content, model)
     while True:
         try:
             yield future.result(timeout=ABUNDANCE_CONNECT_KEEPALIVE_SECONDS)
@@ -1696,6 +1854,7 @@ def exception_message(exc: Exception) -> str:
 
 
 def stream_generator(
+    account: Dict[str, Any],
     model: str,
     conversation_id: str,
     content: str,
@@ -1709,7 +1868,7 @@ def stream_generator(
     resp = None
     try:
         yield stream_start_chunk(model, request_id)
-        connect_waiter = wait_for_abundance_stream_response(conversation_id, content, model)
+        connect_waiter = wait_for_abundance_stream_response(account, conversation_id, content, model)
         while resp is None:
             item = next(connect_waiter)
             if isinstance(item, str):
@@ -1803,12 +1962,13 @@ def stream_generator(
 
 
 def get_complete_response(
+    account: Dict[str, Any],
     model: str,
     conversation_id: str,
     content: str,
     tools: Optional[List[Tool]] = None
 ) -> Dict[str, Any]:
-    resp = call_abundance_api(conversation_id, content, model)
+    resp = call_abundance_api(account, conversation_id, content, model)
     result = ""
     final_text: Optional[str] = None
 
@@ -1914,12 +2074,13 @@ def prepare_chat_execution(
     if active_tools:
         validate_tools(active_tools)
 
-    abundance_conversation_id, content, is_incremental = resolve_conversation_and_content(
+    abundance_account, abundance_conversation_id, content, is_incremental = resolve_conversation_and_content(
         session_key, request.messages, active_tools, request.tool_choice
     )
 
     return {
         "active_tools": active_tools,
+        "abundance_account": abundance_account,
         "abundance_conversation_id": abundance_conversation_id,
         "content": content,
         "is_incremental": is_incremental,
@@ -1963,21 +2124,22 @@ async def chat_completions(
 
     execution = prepare_chat_execution(request, session_key)
     active_tools = execution["active_tools"]
+    abundance_account = execution["abundance_account"]
     content = execution["content"]
     request_id = execution["request_id"]
     abundance_conversation_id = execution["abundance_conversation_id"]
     logger.info(
-        "session_key=%s abundance_conversation_id=%s incremental=%s content_len=%s",
-        session_key, abundance_conversation_id, execution["is_incremental"], len(content)
+        "session_key=%s abundance_account=%s abundance_conversation_id=%s incremental=%s content_len=%s",
+        session_key, account_name(abundance_account), abundance_conversation_id, execution["is_incremental"], len(content)
     )
 
     if request.stream:
         return StreamingResponse(
-            stream_generator(request.model, abundance_conversation_id, content, request_id, active_tools),
+            stream_generator(abundance_account, request.model, abundance_conversation_id, content, request_id, active_tools),
             media_type="text/event-stream"
         )
 
-    result = get_complete_response(request.model, abundance_conversation_id, content, active_tools)
+    result = get_complete_response(abundance_account, request.model, abundance_conversation_id, content, active_tools)
     response = build_chat_completion_payload(request_id, request.model, result, content)
     return JSONResponse(content=response)
 

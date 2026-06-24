@@ -39,6 +39,18 @@ Invoke-RestMethod http://127.0.0.1:18000/healthz
 `ABUNDANCE_OIDC_TOKEN` 是可选项。它通常约 1 小时过期，本服务会在它过期
 或被上游拒绝时自动尝试使用 `session-only` 请求。
 
+多账号轮询可用 `ABUNDANCE_ACCOUNTS_JSON`：
+
+```json
+[
+  {"name": "account-a", "cookie": "session=xxx; oidc_id_token=xxx"},
+  {"name": "account-b", "cookie": "session=yyy; oidc_id_token=yyy"}
+]
+```
+
+也可以用 `ABUNDANCE_COOKIE_1`、`ABUNDANCE_COOKIE_2` 这种编号环境变量。
+新建的上游会话会按账号轮询；同一个已缓存会话会继续使用原账号。
+
 可选配置：
 
 - `ABUNDANCE_BASE_URL`：默认 `https://a.b.u.n.dance`。
@@ -49,6 +61,8 @@ Invoke-RestMethod http://127.0.0.1:18000/healthz
 - `ABUNDANCE_REQUEST_TIMEOUT_SECONDS`：默认 `120`。
 - `ABUNDANCE_CONNECT_KEEPALIVE_SECONDS`：默认 `15`，等待上游建立流式连接时发送 SSE keep-alive。
 - `ABUNDANCE_CONNECT_WORKERS`：默认 `8`，等待上游连接的后台线程数。
+- `MAX_FULL_PROMPT_CHARS`：默认 `24000`，冷启动全量历史超过后会自动压缩。
+- `MAX_FULL_PROMPT_RECENT_MESSAGES`：默认 `16`，长历史压缩时保留的最近消息数。
 - `ABUNDANCE_HTTP_PROXY`：需要代理访问上游时设置。
 - `PORT`：Zeabur 通常会自动注入；未设置时默认 `18000`。
 
