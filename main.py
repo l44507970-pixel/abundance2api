@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional, Dict, Any, Literal, Union
 import curl_cffi.requests
-from curl_cffi.requests.exceptions import HTTPError
+import concurrent.futures
 import time
 import json
 import uuid
@@ -68,11 +68,14 @@ ABUNDANCE_IMPERSONATE = os.getenv("ABUNDANCE_IMPERSONATE", "chrome131")
 ABUNDANCE_REQUEST_TIMEOUT_SECONDS = env_int("ABUNDANCE_REQUEST_TIMEOUT_SECONDS", 120)
 ABUNDANCE_MAX_STATUS_RETRIES = env_int("ABUNDANCE_MAX_STATUS_RETRIES", 2)
 ABUNDANCE_RETRY_BASE_DELAY_SECONDS = 0.5
+ABUNDANCE_CONNECT_KEEPALIVE_SECONDS = max(1, env_int("ABUNDANCE_CONNECT_KEEPALIVE_SECONDS", 15))
+ABUNDANCE_CONNECT_WORKERS = max(1, env_int("ABUNDANCE_CONNECT_WORKERS", 8))
 ABUNDANCE_USER_AGENT = os.getenv(
     "ABUNDANCE_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
 )
+UPSTREAM_CONNECT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=ABUNDANCE_CONNECT_WORKERS)
 
 # 提示词注入模式下的工具调用触发信号（上游不支持原生 function calling）
 TOOL_TRIGGER_SIGNAL = "<<<abundance_tool_call>>>"
@@ -1289,6 +1292,23 @@ def abundance_headers() -> Dict[str, str]:
     }
 
 
+def response_error_detail(resp, max_chars: int = 1200) -> str:
+    try:
+        text = resp.text
+    except Exception:
+        text = ""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return resp.reason or "empty response body"
+    if len(text) > max_chars:
+        return f"{text[:max_chars].rstrip()}..."
+    return text
+
+
+def should_retry_upstream_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code < 600
+
+
 def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
     """带重试地向 a.b.u.n.dance 发 POST；认证失败时自动尝试 session-only。"""
     cookie_variants = abundance_cookie_variants()
@@ -1323,6 +1343,7 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
 
             if resp.status_code in (401, 403):
                 last_auth_status = resp.status_code
+                detail = response_error_detail(resp)
                 try:
                     resp.close()
                 except Exception:
@@ -1339,13 +1360,22 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
                     detail=(
                         f"a.b.u.n.dance rejected the {action} request "
                         f"(HTTP {resp.status_code}). The session cookie may have expired, "
-                        "or the upstream requires a fresh oidc_id_token."
+                        f"or the upstream requires a fresh oidc_id_token. Upstream detail: {detail}"
                     )
                 )
 
-            if attempt == max_attempts:
-                resp.raise_for_status()
-                raise HTTPError(f"HTTP Error {resp.status_code}: {resp.reason}", 0, resp)
+            detail = response_error_detail(resp)
+            if attempt == max_attempts or not should_retry_upstream_status(resp.status_code):
+                try:
+                    resp.close()
+                except Exception:
+                    logger.debug("Failed to close a.b.u.n.dance error response", exc_info=True)
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"a.b.u.n.dance {action} API returned HTTP {resp.status_code}: {detail}"
+                    )
+                )
 
             try:
                 resp.close()
@@ -1354,8 +1384,8 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
 
             delay_seconds = ABUNDANCE_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
             logger.warning(
-                "a.b.u.n.dance %s API returned HTTP %s on attempt %s/%s; retrying in %.2fs",
-                action, resp.status_code, attempt, max_attempts, delay_seconds
+                "a.b.u.n.dance %s API returned HTTP %s on attempt %s/%s; retrying in %.2fs; detail=%s",
+                action, resp.status_code, attempt, max_attempts, delay_seconds, detail
             )
             time.sleep(delay_seconds)
 
@@ -1568,6 +1598,31 @@ def stream_error_chunks(model: str, request_id: str, message: str):
     yield "data: [DONE]\n\n"
 
 
+def stream_start_chunk(model: str, request_id: str) -> str:
+    chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant"},
+            "finish_reason": None
+        }]
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def wait_for_abundance_stream_response(conversation_id: str, content: str, model: str):
+    future = UPSTREAM_CONNECT_EXECUTOR.submit(call_abundance_api, conversation_id, content, model)
+    while True:
+        try:
+            yield future.result(timeout=ABUNDANCE_CONNECT_KEEPALIVE_SECONDS)
+            return
+        except concurrent.futures.TimeoutError:
+            yield ": keep-alive\n\n"
+
+
 def exception_message(exc: Exception) -> str:
     if isinstance(exc, HTTPException):
         return str(exc.detail)
@@ -1587,7 +1642,14 @@ def stream_generator(
     buffered_content = ""
     resp = None
     try:
-        resp = call_abundance_api(conversation_id, content, model)
+        yield stream_start_chunk(model, request_id)
+        connect_waiter = wait_for_abundance_stream_response(conversation_id, content, model)
+        while resp is None:
+            item = next(connect_waiter)
+            if isinstance(item, str):
+                yield item
+            else:
+                resp = item
 
         for event_name, payload, _raw in iter_abundance_sse_events(resp):
             if event_name in {"connecting", "heartbeat"}:

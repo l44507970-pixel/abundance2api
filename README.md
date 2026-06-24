@@ -46,6 +46,8 @@ Invoke-RestMethod http://127.0.0.1:18000/healthz
 - `ABUNDANCE_DEFAULT_INTELLIGENCE`：默认 `standard`。
 - `ABUNDANCE_OIDC_TOKEN`：可选，通常不建议作为唯一登录凭据。
 - `ABUNDANCE_REQUEST_TIMEOUT_SECONDS`：默认 `120`。
+- `ABUNDANCE_CONNECT_KEEPALIVE_SECONDS`：默认 `15`，等待上游建立流式连接时发送 SSE keep-alive。
+- `ABUNDANCE_CONNECT_WORKERS`：默认 `8`，等待上游连接的后台线程数。
 - `ABUNDANCE_HTTP_PROXY`：需要代理访问上游时设置。
 - `PORT`：Zeabur 通常会自动注入；未设置时默认 `18000`。
 
