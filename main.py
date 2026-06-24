@@ -13,6 +13,8 @@ import logging
 import os
 import hashlib
 import secrets
+import base64
+from http.cookies import SimpleCookie
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -57,6 +59,7 @@ ACCEPT_ANY_API_KEY = os.getenv("ACCEPT_ANY_API_KEY", "false").lower() not in {"0
 
 # a.b.u.n.dance 上游配置（本代理 -> a.b.u.n.dance）
 ABUNDANCE_BASE_URL = os.getenv("ABUNDANCE_BASE_URL", "https://a.b.u.n.dance").rstrip("/")
+ABUNDANCE_RAW_COOKIE = os.getenv("ABUNDANCE_COOKIE", "").strip()
 ABUNDANCE_SESSION_COOKIE = os.getenv("ABUNDANCE_SESSION", "").strip()
 ABUNDANCE_OIDC_TOKEN = os.getenv("ABUNDANCE_OIDC_TOKEN", "").strip()
 ABUNDANCE_DEFAULT_SPEED = os.getenv("ABUNDANCE_DEFAULT_SPEED", "default")
@@ -1207,13 +1210,71 @@ def abundance_request_proxies() -> Optional[Dict[str, str]]:
     return {"http": proxy, "https": proxy}
 
 
-def abundance_cookies() -> Dict[str, str]:
-    cookies = {}
+def parse_cookie_header(cookie_header: str) -> Dict[str, str]:
+    if not cookie_header:
+        return {}
+    parsed = SimpleCookie()
+    try:
+        parsed.load(cookie_header)
+    except Exception:
+        logger.warning("Failed to parse ABUNDANCE_COOKIE; falling back to explicit cookie env vars")
+        return {}
+    return {key: morsel.value for key, morsel in parsed.items() if morsel.value}
+
+
+def is_jwt_expired(token: str, leeway_seconds: int = 60) -> bool:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return False
+
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return False
+
+    exp = data.get("exp")
+    if not isinstance(exp, (int, float)):
+        return False
+    return exp <= time.time() + leeway_seconds
+
+
+def abundance_cookies(include_oidc: bool = True) -> Dict[str, str]:
+    cookies = parse_cookie_header(ABUNDANCE_RAW_COOKIE)
     if ABUNDANCE_SESSION_COOKIE:
         cookies["session"] = ABUNDANCE_SESSION_COOKIE
-    if ABUNDANCE_OIDC_TOKEN:
+    if include_oidc and ABUNDANCE_OIDC_TOKEN:
         cookies["oidc_id_token"] = ABUNDANCE_OIDC_TOKEN
+
+    # id_token 通常只有约 1 小时有效期；过期后优先让长期 session 独立工作。
+    oidc_token = cookies.get("oidc_id_token")
+    if oidc_token and is_jwt_expired(oidc_token):
+        cookies.pop("oidc_id_token", None)
     return cookies
+
+
+def abundance_cookie_variants() -> List[Dict[str, str]]:
+    primary = abundance_cookies(include_oidc=True)
+    if not primary:
+        return []
+
+    variants = [primary]
+    if "session" in primary and "oidc_id_token" in primary:
+        session_only = dict(primary)
+        session_only.pop("oidc_id_token", None)
+        variants.append(session_only)
+    return variants
+
+
+def describe_cookie_variant(cookies: Dict[str, str]) -> str:
+    if "session" in cookies and "oidc_id_token" in cookies:
+        return "session+oidc"
+    if "session" in cookies:
+        return "session-only"
+    if "oidc_id_token" in cookies:
+        return "oidc-only"
+    return "custom-cookie"
 
 
 def abundance_headers() -> Dict[str, str]:
@@ -1229,18 +1290,17 @@ def abundance_headers() -> Dict[str, str]:
 
 
 def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
-    """带重试地向 a.b.u.n.dance 发 POST；401/403 视为 cookie 过期，给出可操作的错误信息。"""
-    cookies = abundance_cookies()
-    if not cookies:
+    """带重试地向 a.b.u.n.dance 发 POST；认证失败时自动尝试 session-only。"""
+    cookie_variants = abundance_cookie_variants()
+    if not cookie_variants:
         raise HTTPException(
             status_code=500,
-            detail="Missing ABUNDANCE_SESSION/ABUNDANCE_OIDC_TOKEN. Set them in .env (see .env.example)."
+            detail="Missing ABUNDANCE_COOKIE or ABUNDANCE_SESSION. Set them in .env (see .env.example)."
         )
 
     request_kwargs: Dict[str, Any] = {
         "data": json.dumps(body, ensure_ascii=False).encode("utf-8"),
         "headers": abundance_headers(),
-        "cookies": cookies,
         "stream": stream,
         "timeout": ABUNDANCE_REQUEST_TIMEOUT_SECONDS,
         "impersonate": ABUNDANCE_IMPERSONATE,
@@ -1250,41 +1310,63 @@ def abundance_post(url: str, body: Dict[str, Any], stream: bool, action: str):
         request_kwargs["proxies"] = proxies
 
     max_attempts = ABUNDANCE_MAX_STATUS_RETRIES + 1
-    for attempt in range(1, max_attempts + 1):
-        resp = curl_cffi.requests.post(url, **request_kwargs)
+    last_auth_status: Optional[int] = None
+    for variant_index, cookies in enumerate(cookie_variants):
+        variant_kwargs = dict(request_kwargs)
+        variant_kwargs["cookies"] = cookies
 
-        if resp.status_code == 200:
-            return resp
+        for attempt in range(1, max_attempts + 1):
+            resp = curl_cffi.requests.post(url, **variant_kwargs)
 
-        if resp.status_code in (401, 403):
+            if resp.status_code == 200:
+                return resp
+
+            if resp.status_code in (401, 403):
+                last_auth_status = resp.status_code
+                try:
+                    resp.close()
+                except Exception:
+                    logger.debug("Failed to close a.b.u.n.dance auth-error response", exc_info=True)
+                if variant_index + 1 < len(cookie_variants):
+                    logger.info(
+                        "a.b.u.n.dance rejected %s cookie variant for %s; retrying with next variant",
+                        describe_cookie_variant(cookies),
+                        action
+                    )
+                    break
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"a.b.u.n.dance rejected the {action} request "
+                        f"(HTTP {resp.status_code}). The session cookie may have expired, "
+                        "or the upstream requires a fresh oidc_id_token."
+                    )
+                )
+
+            if attempt == max_attempts:
+                resp.raise_for_status()
+                raise HTTPError(f"HTTP Error {resp.status_code}: {resp.reason}", 0, resp)
+
             try:
                 resp.close()
             except Exception:
-                logger.debug("Failed to close a.b.u.n.dance auth-error response", exc_info=True)
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"a.b.u.n.dance rejected the {action} request "
-                    f"(HTTP {resp.status_code}). The session/oidc_id_token cookies have likely "
-                    "expired; refresh ABUNDANCE_SESSION/ABUNDANCE_OIDC_TOKEN in .env."
-                )
+                logger.debug("Failed to close a.b.u.n.dance retry response", exc_info=True)
+
+            delay_seconds = ABUNDANCE_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "a.b.u.n.dance %s API returned HTTP %s on attempt %s/%s; retrying in %.2fs",
+                action, resp.status_code, attempt, max_attempts, delay_seconds
             )
+            time.sleep(delay_seconds)
 
-        if attempt == max_attempts:
-            resp.raise_for_status()
-            raise HTTPError(f"HTTP Error {resp.status_code}: {resp.reason}", 0, resp)
-
-        try:
-            resp.close()
-        except Exception:
-            logger.debug("Failed to close a.b.u.n.dance retry response", exc_info=True)
-
-        delay_seconds = ABUNDANCE_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-        logger.warning(
-            "a.b.u.n.dance %s API returned HTTP %s on attempt %s/%s; retrying in %.2fs",
-            action, resp.status_code, attempt, max_attempts, delay_seconds
+    if last_auth_status:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"a.b.u.n.dance rejected the {action} request (HTTP {last_auth_status}). "
+                "Refresh ABUNDANCE_SESSION or provide a fresh ABUNDANCE_COOKIE."
+            )
         )
-        time.sleep(delay_seconds)
 
     raise RuntimeError("a.b.u.n.dance API retry loop exited unexpectedly")
 
